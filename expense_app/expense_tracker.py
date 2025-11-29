@@ -8,21 +8,91 @@ from datetime import datetime
 # Configuration
 # ====================================
 EXCEL_FILE = "Master_Sheet_Expenses.xlsx"
+# How many timestamped backups to keep when saving the Excel file
+BACKUP_RETENTION = 5
 
 # ====================================
 # Initialize Session State & Load Data
 # ====================================
-@st.cache_resource
 def load_excel_data():
-    """Load data from Excel file"""
-    if not os.path.exists(EXCEL_FILE):
-        st.error(f"Excel file '{EXCEL_FILE}' not found!")
+    """Load data from Excel file (always read fresh to avoid stale cache)"""
+    abs_path = os.path.abspath(EXCEL_FILE)
+    if not os.path.exists(abs_path):
+        st.error(f"Excel file '{abs_path}' not found!")
         return None
-    return pd.read_excel(EXCEL_FILE, sheet_name='Sheet1')
+    try:
+        return pd.read_excel(abs_path, sheet_name='Sheet1', engine='openpyxl')
+    except Exception as e:
+        st.error(f"Failed to read Excel file '{abs_path}': {e}")
+        return None
 
 def save_excel_data(df):
-    """Save data back to Excel file"""
-    df.to_excel(EXCEL_FILE, sheet_name='Sheet1', index=False)
+    """Atomically save DataFrame to Excel with a backup. Returns (success, message).
+
+    - Writes to a temporary file in the same directory then replaces the original to avoid partial writes.
+    - Creates a timestamped backup of the existing file before replacing.
+    - Returns (True, info_message) on success, (False, error_message) on failure.
+    """
+    abs_path = os.path.abspath(EXCEL_FILE)
+    dir_name = os.path.dirname(abs_path) or '.'
+    try:
+        # Ensure directory exists
+        os.makedirs(dir_name, exist_ok=True)
+
+        # If the target exists, create a timestamped backup
+        backup_path = None
+        if os.path.exists(abs_path):
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup_path = f"{abs_path}.bak.{ts}"
+            try:
+                import shutil
+                shutil.copy2(abs_path, backup_path)
+            except Exception as be:
+                # Continue even if backup fails, but report it
+                return False, f"Failed to create backup '{backup_path}': {be}"
+            # Purge old backups beyond retention
+            try:
+                import glob
+                # Pattern for backups: <abs_path>.bak.*
+                pattern = f"{abs_path}.bak.*"
+                backups = glob.glob(pattern)
+                if len(backups) > BACKUP_RETENTION:
+                    # sort by modification time (oldest first)
+                    backups_sorted = sorted(backups, key=lambda p: os.path.getmtime(p))
+                    num_to_delete = len(backups_sorted) - BACKUP_RETENTION
+                    for old in backups_sorted[:num_to_delete]:
+                        try:
+                            os.remove(old)
+                        except Exception:
+                            pass
+            except Exception:
+                # If purge fails, ignore — not critical
+                pass
+
+        # Write to a temporary file then atomically replace
+        import tempfile
+        fd, tmp_path = tempfile.mkstemp(prefix='tmp_expense_', suffix='.xlsx', dir=dir_name)
+        os.close(fd)
+        try:
+            # Use pandas to write to the temporary file
+            df.to_excel(tmp_path, sheet_name='Sheet1', index=False, engine='openpyxl')
+            # Atomically replace the target
+            os.replace(tmp_path, abs_path)
+        except Exception as we:
+            # Clean up temp file
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            return False, str(we)
+
+        info = f"Wrote '{abs_path}'"
+        if backup_path:
+            info += f" (backup: '{backup_path}')"
+        return True, info
+    except Exception as e:
+        return False, str(e)
 
 def get_individuals():
     """Get list of individuals from the Excel file"""
@@ -66,11 +136,11 @@ def update_expected_value(category, subcategory, value):
     mask = (df['Expense Category'] == category) & (df['Expense SubCategory'] == subcategory)
     if mask.any():
         df.loc[mask, 'Expected'] = value
-        # record payment/update date (ISO format)
-        today = datetime.now().strftime('%Y-%m-%d')
-        df.loc[mask, 'Payment Date'] = today
         st.session_state.df = df
-        save_excel_data(df)
+        success, err = save_excel_data(df)
+        if not success:
+            st.error(f"Failed to save Expected value: {err}")
+            return False
         return True
     return False
 
@@ -80,11 +150,11 @@ def update_actual_value(category, subcategory, value):
     mask = (df['Expense Category'] == category) & (df['Expense SubCategory'] == subcategory)
     if mask.any():
         df.loc[mask, 'Actuals'] = value
-        # record payment/update date
-        today = datetime.now().strftime('%Y-%m-%d')
-        df.loc[mask, 'Payment Date'] = today
         st.session_state.df = df
-        save_excel_data(df)
+        success, err = save_excel_data(df)
+        if not success:
+            st.error(f"Failed to save Actual value: {err}")
+            return False
         return True
     return False
 
@@ -94,11 +164,11 @@ def update_monthly_income(individual, income):
     mask = df['Name'] == individual
     if mask.any():
         df.loc[mask, 'Monthly Income'] = income
-        # record payment/update date for entries matching this individual
-        today = datetime.now().strftime('%Y-%m-%d')
-        df.loc[mask, 'Payment Date'] = today
         st.session_state.df = df
-        save_excel_data(df)
+        success, err = save_excel_data(df)
+        if not success:
+            st.error(f"Failed to save Monthly Income: {err}")
+            return False
         return True
     return False
 
@@ -114,7 +184,11 @@ def get_total_income():
     return total
 
 def get_total_expenses():
-    """Calculate total actual expenses"""
+    """Calculate total actual expenses, excluding open dues.
+
+    Open due: row has a Due Date in the future and Paid is False (or missing/False).
+    This returns the sum of the 'Actuals' column for all non-open-due expense rows.
+    """
     df = st.session_state.df
     expenses_df = df[
         (df['Expense Category'].notna()) & 
@@ -122,8 +196,44 @@ def get_total_expenses():
         (df['Expense Category'] != '') & 
         (df['Expense SubCategory'] != '')
     ]
-    total = pd.to_numeric(expenses_df['Actuals'], errors='coerce').fillna(0).sum()
+    # Exclude amounts tagged against an open due from total expenses
+    today = pd.to_datetime(datetime.now().date())
+    def is_open_due(row):
+        due = row.get('Due Date', pd.NaT)
+        paid = row.get('Paid', False)
+        try:
+            due_dt = pd.to_datetime(due, errors='coerce')
+        except Exception:
+            due_dt = pd.NaT
+        if pd.isna(due_dt):
+            return False
+        if (due_dt > today) and (not bool(paid)):
+            return True
+        return False
+
+    # Filter out open dues
+    mask_open = expenses_df.apply(is_open_due, axis=1)
+    filtered = expenses_df[~mask_open]
+    total = pd.to_numeric(filtered['Actuals'], errors='coerce').fillna(0).sum()
     return float(total)
+
+def get_expected_money_on_hand():
+    """Calculate money on hand based on allocated (Expected) amounts.
+
+    This subtracts Expected amounts (excluding open dues) from total income.
+    """
+    df = st.session_state.df
+    expenses_df = df[
+        (df['Expense Category'].notna()) & 
+        (df['Expense SubCategory'].notna()) &
+        (df['Expense Category'] != '') & 
+        (df['Expense SubCategory'] != '')
+    ]
+    # For Expected money-on-hand we treat allocated amounts as reserved now
+    # (i.e. include Expected values regardless of Due Date or Paid flag)
+    total_expected = pd.to_numeric(expenses_df['Expected'], errors='coerce').fillna(0).sum()
+    total_income = get_total_income()
+    return float(total_income - total_expected)
 
 def get_remaining_money():
     """Calculate remaining money (Total Income - Total Actual Expenses)"""
@@ -152,13 +262,17 @@ def add_category_subcategory(category, subcategory, expected=0.0, actuals=0.0):
         'Expense SubCategory': [subcategory],
         'Expected': [float(expected)],
         'Actuals': [float(actuals)],
-        'Payment Date': [today]
+        'Payment Date': [pd.NaT],
+        'Due Date': [pd.NaT],
+        'Paid': [False]
     })
     
     # Append to dataframe
     df = pd.concat([df, new_row], ignore_index=True)
     st.session_state.df = df
-    save_excel_data(df)
+    success, err = save_excel_data(df)
+    if not success:
+        return False, f"Failed to save new category/subcategory: {err}"
     return True, f"✅ Added '{subcategory}' under '{category}'"
 
 def remove_category_subcategory(category, subcategory):
@@ -173,8 +287,29 @@ def remove_category_subcategory(category, subcategory):
     # Remove the row
     df = df[~mask]
     st.session_state.df = df
-    save_excel_data(df)
+    success, err = save_excel_data(df)
+    if not success:
+        return False, f"Failed to save removal: {err}"
     return True, f"✅ Removed '{subcategory}' from '{category}'"
+
+def set_paid_status(category, subcategory, paid_flag):
+    """Set the Paid flag for a category/subcategory and update Payment Date when marked paid."""
+    df = st.session_state.df
+    mask = (df['Expense Category'] == category) & (df['Expense SubCategory'] == subcategory)
+    if not mask.any():
+        return False, "Category/Subcategory not found"
+    df.loc[mask, 'Paid'] = bool(paid_flag)
+    if paid_flag:
+        today = datetime.now().strftime('%Y-%m-%d')
+        df.loc[mask, 'Payment Date'] = today
+    else:
+        # Clear payment date when unmarking paid
+        df.loc[mask, 'Payment Date'] = pd.NaT
+    st.session_state.df = df
+    success, err = save_excel_data(df)
+    if not success:
+        return False, f"Failed to save Paid status: {err}"
+    return True, f"✅ Set Paid={paid_flag} for '{subcategory}' in '{category}'"
 
 def add_category(category):
     """Add a new category with placeholder subcategory"""
@@ -196,13 +331,17 @@ def add_category(category):
         'Expense SubCategory': ['Other'],
         'Expected': [0.0],
         'Actuals': [0.0],
-        'Payment Date': [today]
+        'Payment Date': [pd.NaT],
+        'Due Date': [pd.NaT],
+        'Paid': [False]
     })
     
     # Append to dataframe
     df = pd.concat([df, new_row], ignore_index=True)
     st.session_state.df = df
-    save_excel_data(df)
+    success, err = save_excel_data(df)
+    if not success:
+        return False, f"Failed to save new category: {err}"
     return True, f"✅ Added new category '{category}' with placeholder 'Other' subcategory"
 
 def remove_category(category):
@@ -219,7 +358,9 @@ def remove_category(category):
     # Remove all rows with this category
     df = df[~mask]
     st.session_state.df = df
-    save_excel_data(df)
+    success, err = save_excel_data(df)
+    if not success:
+        return False, f"Failed to save category removal: {err}"
     return True, f"✅ Removed category '{category}' ({count} subcategories deleted)"
 
 # Load data
@@ -230,10 +371,21 @@ if st.session_state.df is None:
     st.stop()
 
 # Ensure 'Payment Date' column exists (store ISO date string when updates happen)
-if 'Payment Date' not in st.session_state.df.columns:
-    st.session_state.df['Payment Date'] = pd.NaT
-    # Save so Excel has the column for persistence
-    save_excel_data(st.session_state.df)
+cols_to_ensure = {
+    'Payment Date': pd.NaT,
+    'Due Date': pd.NaT,
+    'Paid': False
+}
+for col, default in cols_to_ensure.items():
+    if col not in st.session_state.df.columns:
+        st.session_state.df[col] = default
+        # avoid dtype surprises: coerce dates later when formatting
+# Save the sheet if we added missing columns
+save_result = save_excel_data(st.session_state.df)
+if isinstance(save_result, tuple):
+    success, err = save_result
+    if not success:
+        st.error(f"Failed to save master sheet after adding missing columns: {err}")
 # ====================================
 # Page Config
 # ====================================
@@ -286,6 +438,25 @@ with col_remaining:
             border=True
         )
 
+# Also show Expected Money on Hand (uses allocated/Expected excluding open dues)
+expected_remaining = get_expected_money_on_hand()
+col_e1, col_e2, col_e3 = st.columns(3)
+with col_e2:
+    if expected_remaining >= 0:
+        st.metric(
+            "📊 Expected Money on Hand",
+            f"${expected_remaining:,.2f}",
+            delta="Based on allocated (Expected)",
+            border=False
+        )
+    else:
+        st.metric(
+            "📊 Expected Money on Hand",
+            f"${expected_remaining:,.2f}",
+            delta="⚠️ Deficit (allocated)",
+            border=False
+        )
+
 st.markdown("---")
 
 # Create tabs for different sections
@@ -321,9 +492,35 @@ with tab1:
                     key="subcategory_select"
                 )
                 
-                # Get current values
-                current_expected = get_expected_value(selected_category, selected_subcategory)
-                current_actual = get_actual_value(selected_category, selected_subcategory)
+                # Get current values (prefer fresh read from Excel so UI shows latest saved values)
+                current_expected = 0.0
+                current_actual = 0.0
+                try:
+                    df_disk = load_excel_data()
+                except Exception:
+                    df_disk = None
+
+                if df_disk is not None:
+                    match_disk = df_disk[(df_disk['Expense Category'] == selected_category) & (df_disk['Expense SubCategory'] == selected_subcategory)]
+                    if not match_disk.empty:
+                        current_expected = match_disk.iloc[0].get('Expected', 0.0)
+                        current_actual = match_disk.iloc[0].get('Actuals', 0.0)
+                        # coerce to float safely
+                        try:
+                            current_expected = float(pd.to_numeric(current_expected, errors='coerce'))
+                        except Exception:
+                            current_expected = 0.0
+                        try:
+                            current_actual = float(pd.to_numeric(current_actual, errors='coerce'))
+                        except Exception:
+                            current_actual = 0.0
+                    else:
+                        # fallback to session-state
+                        current_expected = get_expected_value(selected_category, selected_subcategory)
+                        current_actual = get_actual_value(selected_category, selected_subcategory)
+                else:
+                    current_expected = get_expected_value(selected_category, selected_subcategory)
+                    current_actual = get_actual_value(selected_category, selected_subcategory)
                 
                 st.info(f"📌 Current Values for '{selected_subcategory}'")
                 st.write(f"**Expected:** ${current_expected:.2f}")
@@ -331,7 +528,7 @@ with tab1:
                 
                 st.markdown("---")
                 
-                # Input fields for new values
+                # Input fields for new values (Expected & Actual)
                 new_expected = st.number_input(
                     "Update Expected Amount ($)",
                     min_value=0.0,
@@ -350,18 +547,58 @@ with tab1:
                     key="new_actual"
                 )
                 
+                # Get current due date and paid flag for this item
+                df_local = st.session_state.df
+                match = df_local[(df_local['Expense Category'] == selected_category) & (df_local['Expense SubCategory'] == selected_subcategory)]
+                if not match.empty:
+                    raw_due = match.iloc[0].get('Due Date', pd.NaT)
+                    raw_paid = match.iloc[0].get('Paid', False)
+                else:
+                    raw_due = pd.NaT
+                    raw_paid = False
+
+                if pd.notna(raw_due):
+                    try:
+                        current_due = pd.to_datetime(raw_due, errors='coerce').date()
+                    except Exception:
+                        current_due = None
+                else:
+                    current_due = None
+
+                has_due = st.checkbox("Has Due Date", value=(current_due is not None), key="has_due")
+                if has_due:
+                    due_val = st.date_input("Due Date", value=current_due if current_due is not None else datetime.now().date(), key="due_date_input")
+                else:
+                    due_val = None
+
+                paid_flag = st.checkbox("Paid", value=bool(raw_paid), key="paid_checkbox")
+
                 col_save, col_clear = st.columns(2)
                 
                 with col_save:
                     if st.button("💾 Save Changes", width='stretch', key="save_expense"):
                         updated_expected = update_expected_value(selected_category, selected_subcategory, new_expected)
                         updated_actual = update_actual_value(selected_category, selected_subcategory, new_actual)
-                        
-                        if updated_expected or updated_actual:
-                            st.success(f"✅ Updated '{selected_subcategory}'")
-                            st.balloons()
-                            st.rerun()
-                
+
+                        # Update Due Date field
+                        mask = (st.session_state.df['Expense Category'] == selected_category) & (st.session_state.df['Expense SubCategory'] == selected_subcategory)
+                        if has_due and due_val is not None:
+                            st.session_state.df.loc[mask, 'Due Date'] = pd.to_datetime(due_val).strftime('%Y-%m-%d')
+                        else:
+                            st.session_state.df.loc[mask, 'Due Date'] = pd.NaT
+                        # Save and check result
+                        save_ok, save_msg = save_excel_data(st.session_state.df)
+                        if not save_ok:
+                            st.error(f"Failed to save Due Date change: {save_msg}")
+                        else:
+                            # Update Paid flag (this will also set Payment Date appropriately)
+                            success_paid, msg_paid = set_paid_status(selected_category, selected_subcategory, paid_flag)
+
+                            if (updated_expected or updated_actual or success_paid):
+                                st.success(f"✅ Updated '{selected_subcategory}'")
+                                st.balloons()
+                                st.rerun()
+
                 with col_clear:
                     if st.button("🔄 Refresh", width='stretch', key="refresh_expense"):
                         st.rerun()
@@ -384,13 +621,15 @@ with tab1:
         summary_data['Actuals'] = pd.to_numeric(summary_data['Actuals'], errors='coerce').fillna(0)
         summary_data['Variance'] = summary_data['Actuals'] - summary_data['Expected']
         
-        # Create display dataframe and include Payment Date
+        # Create display dataframe and include Payment Date, Due Date, Paid
         display_df = summary_data[[
             'Expense Category',
             'Expense SubCategory',
             'Expected',
             'Actuals',
             'Variance',
+            'Due Date',
+            'Paid',
             'Payment Date'
         ]].copy()
 
@@ -401,8 +640,11 @@ with tab1:
             lambda x: f"${x:.2f} 📈" if x > 0 else f"${x:.2f} 📉" if x < 0 else "$0.00 ✓"
         )
 
-        # Format payment date (handle NaT or missing values)
+        # Format due date and payment date (handle NaT or missing values)
+        display_df['Due Date'] = pd.to_datetime(display_df['Due Date'], errors='coerce').dt.strftime('%Y-%m-%d').fillna('-')
         display_df['Payment Date'] = pd.to_datetime(display_df['Payment Date'], errors='coerce').dt.strftime('%Y-%m-%d').fillna('-')
+        # Format Paid as Yes/No
+        display_df['Paid'] = display_df['Paid'].apply(lambda x: 'Yes' if bool(x) else 'No')
 
         st.dataframe(display_df, width='stretch', hide_index=True)
 
@@ -626,27 +868,39 @@ with tab3:
     df = st.session_state.df
     cat_list = []
     for category in get_categories():
-        for subcategory in get_subcategories(category):
-            exp_val = get_expected_value(category, subcategory)
-            act_val = get_actual_value(category, subcategory)
-            # find payment date for this category/subcategory
-            match = df[(df['Expense Category'] == category) & (df['Expense SubCategory'] == subcategory)]
-            if not match.empty:
-                pd_raw = match.iloc[0].get('Payment Date', None)
-            else:
-                pd_raw = None
-            try:
-                pd_formatted = pd.to_datetime(pd_raw, errors='coerce').strftime('%Y-%m-%d') if pd_raw is not None else '-'
-            except Exception:
-                pd_formatted = '-'
+            for subcategory in get_subcategories(category):
+                exp_val = get_expected_value(category, subcategory)
+                act_val = get_actual_value(category, subcategory)
+                # find metadata for this category/subcategory
+                match = df[(df['Expense Category'] == category) & (df['Expense SubCategory'] == subcategory)]
+                if not match.empty:
+                    row = match.iloc[0]
+                    pd_raw = row.get('Payment Date', None)
+                    due_raw = row.get('Due Date', None)
+                    paid_raw = row.get('Paid', False)
+                else:
+                    pd_raw = None
+                    due_raw = None
+                    paid_raw = False
 
-            cat_list.append({
-                'Category': category,
-                'Subcategory': subcategory,
-                'Expected': f"${exp_val:.2f}",
-                'Actual': f"${act_val:.2f}",
-                'Payment Date': pd_formatted
-            })
+                try:
+                    pd_formatted = pd.to_datetime(pd_raw, errors='coerce').strftime('%Y-%m-%d') if pd_raw is not None else '-'
+                except Exception:
+                    pd_formatted = '-'
+                try:
+                    due_formatted = pd.to_datetime(due_raw, errors='coerce').strftime('%Y-%m-%d') if due_raw is not None else '-'
+                except Exception:
+                    due_formatted = '-'
+
+                cat_list.append({
+                    'Category': category,
+                    'Subcategory': subcategory,
+                    'Expected': f"${exp_val:.2f}",
+                    'Actual': f"${act_val:.2f}",
+                    'Due Date': due_formatted,
+                    'Paid': 'Yes' if bool(paid_raw) else 'No',
+                    'Payment Date': pd_formatted
+                })
     
     if cat_list:
         cat_df = pd.DataFrame(cat_list)
@@ -673,6 +927,9 @@ with tab4:
     dashboard_df['Expected'] = pd.to_numeric(dashboard_df['Expected'], errors='coerce').fillna(0)
     dashboard_df['Actuals'] = pd.to_numeric(dashboard_df['Actuals'], errors='coerce').fillna(0)
     dashboard_df['Variance'] = dashboard_df['Actuals'] - dashboard_df['Expected']
+    # Ensure Due Date is parsed and sort dashboard by Due Date ascending (earliest first)
+    dashboard_df['DueDate_dt'] = pd.to_datetime(dashboard_df.get('Due Date', pd.NaT), errors='coerce')
+    dashboard_df = dashboard_df.sort_values(by='DueDate_dt', ascending=True, na_position='last')
     
     # Metrics
     col1, col2, col3, col4 = st.columns(4)

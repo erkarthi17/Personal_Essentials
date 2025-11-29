@@ -13,11 +13,16 @@ echo.
 echo Starting Streamlit app...
 echo.
 
-REM Start Streamlit in a new terminal window and keep it running
-start /B "" cmd /c "py -3 -m streamlit run expense_tracker.py --logger.level=error"
-
-REM Wait a few seconds for Streamlit to start
-timeout /t 3 /nobreak
+REM If Streamlit is already running on port 8501, don't start another instance
+netstat -ano | findstr ":8501" >nul 2>&1
+if %errorlevel%==0 (
+	echo Streamlit already appears to be running on port 8501. Opening browser only.
+) else (
+	echo Starting Streamlit app...
+	start /B "" cmd /c "py -3 -m streamlit run expense_tracker.py --server.runOnSave=false --logger.level=error"
+	REM Wait a few seconds for Streamlit to start
+	timeout /t 3 /nobreak
+)
 
 REM Automatically open the app in default browser
 echo Opening app in your browser...
