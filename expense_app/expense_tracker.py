@@ -66,6 +66,9 @@ def update_expected_value(category, subcategory, value):
     mask = (df['Expense Category'] == category) & (df['Expense SubCategory'] == subcategory)
     if mask.any():
         df.loc[mask, 'Expected'] = value
+        # record payment/update date (ISO format)
+        today = datetime.now().strftime('%Y-%m-%d')
+        df.loc[mask, 'Payment Date'] = today
         st.session_state.df = df
         save_excel_data(df)
         return True
@@ -77,6 +80,9 @@ def update_actual_value(category, subcategory, value):
     mask = (df['Expense Category'] == category) & (df['Expense SubCategory'] == subcategory)
     if mask.any():
         df.loc[mask, 'Actuals'] = value
+        # record payment/update date
+        today = datetime.now().strftime('%Y-%m-%d')
+        df.loc[mask, 'Payment Date'] = today
         st.session_state.df = df
         save_excel_data(df)
         return True
@@ -88,10 +94,133 @@ def update_monthly_income(individual, income):
     mask = df['Name'] == individual
     if mask.any():
         df.loc[mask, 'Monthly Income'] = income
+        # record payment/update date for entries matching this individual
+        today = datetime.now().strftime('%Y-%m-%d')
+        df.loc[mask, 'Payment Date'] = today
         st.session_state.df = df
         save_excel_data(df)
         return True
     return False
+
+def get_total_income():
+    """Calculate total monthly income from all individuals"""
+    df = st.session_state.df
+    individuals = df[df['Name'].notna()]['Name'].unique()
+    total = 0.0
+    for individual in individuals:
+        income_row = df[df['Name'] == individual]['Monthly Income'].iloc[0]
+        if pd.notna(income_row):
+            total += float(income_row)
+    return total
+
+def get_total_expenses():
+    """Calculate total actual expenses"""
+    df = st.session_state.df
+    expenses_df = df[
+        (df['Expense Category'].notna()) & 
+        (df['Expense SubCategory'].notna()) &
+        (df['Expense Category'] != '') & 
+        (df['Expense SubCategory'] != '')
+    ]
+    total = pd.to_numeric(expenses_df['Actuals'], errors='coerce').fillna(0).sum()
+    return float(total)
+
+def get_remaining_money():
+    """Calculate remaining money (Total Income - Total Actual Expenses)"""
+    total_income = get_total_income()
+    total_expenses = get_total_expenses()
+    return total_income - total_expenses
+
+def add_category_subcategory(category, subcategory, expected=0.0, actuals=0.0):
+    """Add a new category/subcategory combination to the Excel file"""
+    df = st.session_state.df
+    
+    # Check if combination already exists
+    existing = df[(df['Expense Category'] == category) & (df['Expense SubCategory'] == subcategory)]
+    if not existing.empty:
+        return False, "Category/Subcategory combination already exists!"
+    
+    # record creation date
+    today = datetime.now().strftime('%Y-%m-%d')
+    # Create a new row
+    new_row = pd.DataFrame({
+        'Name': [None],
+        'Monthly Income': [None],
+        'Unnamed: 2': [None],
+        'Unnamed: 3': [None],
+        'Expense Category': [category],
+        'Expense SubCategory': [subcategory],
+        'Expected': [float(expected)],
+        'Actuals': [float(actuals)],
+        'Payment Date': [today]
+    })
+    
+    # Append to dataframe
+    df = pd.concat([df, new_row], ignore_index=True)
+    st.session_state.df = df
+    save_excel_data(df)
+    return True, f"✅ Added '{subcategory}' under '{category}'"
+
+def remove_category_subcategory(category, subcategory):
+    """Remove a category/subcategory combination from the Excel file"""
+    df = st.session_state.df
+    
+    # Check if combination exists
+    mask = (df['Expense Category'] == category) & (df['Expense SubCategory'] == subcategory)
+    if not mask.any():
+        return False, "Category/Subcategory combination not found!"
+    
+    # Remove the row
+    df = df[~mask]
+    st.session_state.df = df
+    save_excel_data(df)
+    return True, f"✅ Removed '{subcategory}' from '{category}'"
+
+def add_category(category):
+    """Add a new category with placeholder subcategory"""
+    df = st.session_state.df
+    
+    # Check if category already exists
+    if category in df['Expense Category'].values:
+        return False, "Category already exists!"
+    
+    # Create a new row with placeholder
+    today = datetime.now().strftime('%Y-%m-%d')
+    # Create a new row with placeholder
+    new_row = pd.DataFrame({
+        'Name': [None],
+        'Monthly Income': [None],
+        'Unnamed: 2': [None],
+        'Unnamed: 3': [None],
+        'Expense Category': [category],
+        'Expense SubCategory': ['Other'],
+        'Expected': [0.0],
+        'Actuals': [0.0],
+        'Payment Date': [today]
+    })
+    
+    # Append to dataframe
+    df = pd.concat([df, new_row], ignore_index=True)
+    st.session_state.df = df
+    save_excel_data(df)
+    return True, f"✅ Added new category '{category}' with placeholder 'Other' subcategory"
+
+def remove_category(category):
+    """Remove an entire category and all its subcategories"""
+    df = st.session_state.df
+    
+    # Check if category exists
+    mask = df['Expense Category'] == category
+    if not mask.any():
+        return False, "Category not found!"
+    
+    count = mask.sum()
+    
+    # Remove all rows with this category
+    df = df[~mask]
+    st.session_state.df = df
+    save_excel_data(df)
+    return True, f"✅ Removed category '{category}' ({count} subcategories deleted)"
 
 # Load data
 if 'df' not in st.session_state:
@@ -100,6 +229,11 @@ if 'df' not in st.session_state:
 if st.session_state.df is None:
     st.stop()
 
+# Ensure 'Payment Date' column exists (store ISO date string when updates happen)
+if 'Payment Date' not in st.session_state.df.columns:
+    st.session_state.df['Payment Date'] = pd.NaT
+    # Save so Excel has the column for persistence
+    save_excel_data(st.session_state.df)
 # ====================================
 # Page Config
 # ====================================
@@ -112,8 +246,50 @@ st.title("💰 Monthly Expense Tracker")
 st.markdown("*Data source: Master_Sheet_Expenses.xlsx*")
 st.markdown("---")
 
+# Display Money Summary at Top
+col_income, col_expenses, col_remaining = st.columns(3)
+
+total_income = get_total_income()
+total_expenses = get_total_expenses()
+remaining_money = get_remaining_money()
+
+with col_income:
+    st.metric(
+        "💵 Total Monthly Income",
+        f"${total_income:,.2f}",
+        delta=None,
+        border=True
+    )
+
+with col_expenses:
+    st.metric(
+        "💸 Total Expenses (Actual)",
+        f"${total_expenses:,.2f}",
+        delta=f"{(total_expenses/total_income*100) if total_income > 0 else 0:.1f}% of income",
+        border=True
+    )
+
+with col_remaining:
+    # Color code based on remaining money
+    if remaining_money >= 0:
+        st.metric(
+            "💰 Money on Hand",
+            f"${remaining_money:,.2f}",
+            delta="✅ Available",
+            border=True
+        )
+    else:
+        st.metric(
+            "💰 Money on Hand",
+            f"${remaining_money:,.2f}",
+            delta="⚠️ Deficit",
+            border=True
+        )
+
+st.markdown("---")
+
 # Create tabs for different sections
-tab1, tab2, tab3, tab4 = st.tabs(["📝 Manage Expenses", "👥 Individual Income", "📊 Dashboard", "📈 Analysis"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📝 Manage Expenses", "👥 Individual Income", "⚙️ Manage Categories", "📊 Dashboard", "📈 Analysis"])
 
 # ====================================
 # TAB 1: Manage Expenses
@@ -208,21 +384,26 @@ with tab1:
         summary_data['Actuals'] = pd.to_numeric(summary_data['Actuals'], errors='coerce').fillna(0)
         summary_data['Variance'] = summary_data['Actuals'] - summary_data['Expected']
         
-        # Create display dataframe
+        # Create display dataframe and include Payment Date
         display_df = summary_data[[
             'Expense Category',
             'Expense SubCategory',
             'Expected',
             'Actuals',
-            'Variance'
+            'Variance',
+            'Payment Date'
         ]].copy()
-        
-        display_df['Expected'] = display_df['Expected'].apply(lambda x: f"${x:.2f}")
-        display_df['Actuals'] = display_df['Actuals'].apply(lambda x: f"${x:.2f}")
+
+        # Format numeric columns
+        display_df['Expected'] = pd.to_numeric(display_df['Expected'], errors='coerce').fillna(0).apply(lambda x: f"${x:.2f}")
+        display_df['Actuals'] = pd.to_numeric(display_df['Actuals'], errors='coerce').fillna(0).apply(lambda x: f"${x:.2f}")
         display_df['Variance'] = summary_data['Variance'].apply(
             lambda x: f"${x:.2f} 📈" if x > 0 else f"${x:.2f} 📉" if x < 0 else "$0.00 ✓"
         )
-        
+
+        # Format payment date (handle NaT or missing values)
+        display_df['Payment Date'] = pd.to_datetime(display_df['Payment Date'], errors='coerce').dt.strftime('%Y-%m-%d').fillna('-')
+
         st.dataframe(display_df, width='stretch', hide_index=True)
 
 # ====================================
@@ -293,9 +474,190 @@ with tab2:
         st.warning("No individuals found in Excel file")
 
 # ====================================
-# TAB 3: Dashboard
+# TAB 3: Manage Categories
 # ====================================
 with tab3:
+    st.header("⚙️ Manage Categories & Subcategories")
+    
+    tab3_col1, tab3_col2 = st.columns(2)
+    
+    # Left column: Add new category/subcategory
+    with tab3_col1:
+        st.subheader("➕ Add New Expense")
+        
+        add_method = st.radio(
+            "Choose what to add:",
+            ["Add Category & Subcategory", "Add Subcategory to Existing"],
+            key="add_method"
+        )
+        
+        if add_method == "Add Category & Subcategory":
+            new_category = st.text_input(
+                "New Category Name",
+                placeholder="e.g., Insurance, Travel",
+                key="new_cat_input"
+            )
+            new_subcategory = st.text_input(
+                "Subcategory Name",
+                placeholder="e.g., Health Insurance, Flight",
+                key="new_subcat_input_1"
+            )
+            expected_amount = st.number_input(
+                "Expected Amount ($)",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                format="%.2f",
+                key="expected_new_1"
+            )
+            
+            if st.button("➕ Add Category & Subcategory", width='stretch', key="add_cat_subcat"):
+                if new_category.strip() and new_subcategory.strip():
+                    success, message = add_category_subcategory(new_category.strip(), new_subcategory.strip(), expected_amount)
+                    if success:
+                        st.success(message)
+                        st.rerun()
+                    else:
+                        st.error(message)
+                else:
+                    st.error("Please fill in both category and subcategory names")
+        
+        else:  # Add Subcategory to Existing
+            categories = get_categories()
+            if categories:
+                existing_category = st.selectbox(
+                    "Select Existing Category",
+                    categories,
+                    key="existing_cat_select"
+                )
+                new_subcategory_2 = st.text_input(
+                    "New Subcategory Name",
+                    placeholder="e.g., Dental, Train",
+                    key="new_subcat_input_2"
+                )
+                expected_amount_2 = st.number_input(
+                    "Expected Amount ($)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.01,
+                    format="%.2f",
+                    key="expected_new_2"
+                )
+                
+                if st.button("➕ Add Subcategory", width='stretch', key="add_subcat"):
+                    if new_subcategory_2.strip():
+                        success, message = add_category_subcategory(existing_category, new_subcategory_2.strip(), expected_amount_2)
+                        if success:
+                            st.success(message)
+                            st.rerun()
+                        else:
+                            st.error(message)
+                    else:
+                        st.error("Please enter subcategory name")
+            else:
+                st.error("No categories found. Add a category first.")
+    
+    # Right column: Remove category/subcategory
+    with tab3_col2:
+        st.subheader("❌ Remove Expense")
+        
+        remove_method = st.radio(
+            "Choose what to remove:",
+            ["Remove Subcategory", "Remove Entire Category"],
+            key="remove_method"
+        )
+        
+        if remove_method == "Remove Subcategory":
+            categories = get_categories()
+            if categories:
+                sel_category = st.selectbox(
+                    "Select Category",
+                    categories,
+                    key="cat_for_remove"
+                )
+                subcategories = get_subcategories(sel_category)
+                if subcategories:
+                    sel_subcategory = st.selectbox(
+                        "Select Subcategory to Remove",
+                        subcategories,
+                        key="subcat_for_remove"
+                    )
+                    
+                    st.warning(f"⚠️ This will permanently delete '{sel_subcategory}' from '{sel_category}'")
+                    
+                    if st.button("❌ Remove Subcategory", width='stretch', key="remove_subcat"):
+                        success, message = remove_category_subcategory(sel_category, sel_subcategory)
+                        if success:
+                            st.success(message)
+                            st.rerun()
+                        else:
+                            st.error(message)
+                else:
+                    st.warning("No subcategories found in this category")
+            else:
+                st.error("No categories found")
+        
+        else:  # Remove Entire Category
+            categories = get_categories()
+            if categories:
+                cat_to_remove = st.selectbox(
+                    "Select Category to Remove",
+                    categories,
+                    key="cat_to_remove"
+                )
+                
+                num_subcats = len(get_subcategories(cat_to_remove))
+                st.error(f"🚨 This will delete the entire '{cat_to_remove}' category and {num_subcats} subcategories")
+                
+                if st.button("❌ Remove Entire Category", width='stretch', key="remove_cat"):
+                    success, message = remove_category(cat_to_remove)
+                    if success:
+                        st.success(message)
+                        st.rerun()
+                    else:
+                        st.error(message)
+            else:
+                st.error("No categories found")
+    
+    st.markdown("---")
+    st.subheader("📋 All Categories & Subcategories")
+    
+    # Display all categories and subcategories
+    df = st.session_state.df
+    cat_list = []
+    for category in get_categories():
+        for subcategory in get_subcategories(category):
+            exp_val = get_expected_value(category, subcategory)
+            act_val = get_actual_value(category, subcategory)
+            # find payment date for this category/subcategory
+            match = df[(df['Expense Category'] == category) & (df['Expense SubCategory'] == subcategory)]
+            if not match.empty:
+                pd_raw = match.iloc[0].get('Payment Date', None)
+            else:
+                pd_raw = None
+            try:
+                pd_formatted = pd.to_datetime(pd_raw, errors='coerce').strftime('%Y-%m-%d') if pd_raw is not None else '-'
+            except Exception:
+                pd_formatted = '-'
+
+            cat_list.append({
+                'Category': category,
+                'Subcategory': subcategory,
+                'Expected': f"${exp_val:.2f}",
+                'Actual': f"${act_val:.2f}",
+                'Payment Date': pd_formatted
+            })
+    
+    if cat_list:
+        cat_df = pd.DataFrame(cat_list)
+        st.dataframe(cat_df, width='stretch', hide_index=True)
+    else:
+        st.info("No categories/subcategories found")
+
+# ====================================
+# TAB 4: Dashboard
+# ====================================
+with tab4:
     st.header("📊 Expense Dashboard")
     
     df = st.session_state.df
@@ -362,9 +724,9 @@ with tab3:
         st.pyplot(fig)
 
 # ====================================
-# TAB 4: Analysis
+# TAB 5: Analysis
 # ====================================
-with tab4:
+with tab5:
     st.header("📈 Financial Analysis")
     
     df = st.session_state.df
