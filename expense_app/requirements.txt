@@ -1,0 +1,6 @@
+streamlit
+pandas>=2.0
+matplotlib
+openpyxl
+# Pre-pinned pyarrow to avoid build issues on Windows
+pyarrow>=13.0
