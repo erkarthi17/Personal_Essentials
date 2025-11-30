@@ -172,6 +172,29 @@ def update_monthly_income(individual, income):
         return True
     return False
 
+def reset_monthly():
+    """Reset dynamic monthly fields across the sheet.
+
+    This will zero 'Actuals', clear 'Payment Date', and set 'Paid' to False for all expense rows.
+    It intentionally does NOT change 'Expected' or 'Monthly Income'.
+    """
+    df = st.session_state.df.copy()
+    # Identify expense rows
+    mask = (
+        (df['Expense Category'].notna()) &
+        (df['Expense SubCategory'].notna()) &
+        (df['Expense Category'] != '') &
+        (df['Expense SubCategory'] != '')
+    )
+    if mask.any():
+        df.loc[mask, 'Actuals'] = 0
+        df.loc[mask, 'Payment Date'] = pd.NaT
+        df.loc[mask, 'Paid'] = False
+        st.session_state.df = df
+        success, msg = save_excel_data(df)
+        return success, msg
+    return False, "No expense rows to reset"
+
 def get_total_income():
     """Calculate total monthly income from all individuals"""
     df = st.session_state.df
@@ -467,6 +490,21 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["📝 Manage Expenses", "👥 Individual
 # ====================================
 with tab1:
     st.header("📝 Manage Expenses")
+    with st.expander("Monthly Reset (Admin)", expanded=False):
+        st.write("Use this to reset monthly dynamic values. This will set all 'Actuals' to 0, clear 'Payment Date', and uncheck 'Paid' for all expense rows. It will NOT change 'Expected' or 'Monthly Income'.")
+        confirm = st.text_input("Type RESET to confirm", value="", key="reset_confirm_input")
+        if st.button("Reset Monthly Values", key="reset_monthly_btn"):
+            if confirm.strip().upper() == "RESET":
+                ok, m = reset_monthly()
+                if ok:
+                    st.success("Monthly values reset successfully.")
+                    st.info(m)
+                    st.balloons()
+                    st.experimental_rerun()
+                else:
+                    st.error(f"Reset failed: {m}")
+            else:
+                st.error("Confirmation text does not match 'RESET'. Type RESET to proceed.")
     
     col1, col2 = st.columns(2)
     
